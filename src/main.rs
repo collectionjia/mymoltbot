@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -370,9 +370,9 @@ async fn main() -> Result<()> {
     const MIN_TRADE_INTERVAL: Duration = Duration::from_secs(3);
     let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> = Arc::new(tokio::sync::Mutex::new(None));
 
-    // 定时 Merge：每 N 分钟根据持仓执行 merge，仅对 YES+NO 双边都持仓的市场
+    // 定时 Merge：每 N 分钟根据持仓执行 merge（倒计时策略启用时不执行）
     let merge_interval = config.merge_interval_minutes;
-    if merge_interval > 0 {
+    if merge_interval > 0 && !config.enable_countdown_strategy {
         if let Some(proxy) = config.proxy_address {
             let private_key = config.private_key.clone();
             let position_tracker = _risk_manager.position_tracker().clone();
@@ -475,12 +475,32 @@ async fn main() -> Result<()> {
 
         // 按市场记录上一拍卖一价，用于计算涨跌方向（仅一次 HashMap 读写，不影响监控性能）
         let last_prices: DashMap<B256, (Decimal, Decimal)> = DashMap::new();
+        // 倒计时策略：日志每2秒输出一次
+        let mut last_log_time = Instant::now();
+
+        // 倒计时策略状态：market_id -> (token_id, "YES"|"NO", order_size)
+        let countdown_positions: DashMap<B256, (U256, String, Decimal)> = DashMap::new();
+        let countdown_totals: Arc<Mutex<(Decimal, Decimal)>> = Arc::new(Mutex::new((dec!(0), dec!(0))));
+        if config.enable_countdown_strategy && config.proxy_address.is_some() {
+            info!(
+                "⏱️ 倒计时策略已启用 | 买入窗口:{}~{}秒 | 卖出:{}秒 | 单笔:${}",
+                config.countdown_buy_window_end_secs,
+                config.countdown_buy_window_start_secs,
+                config.countdown_sell_at_secs,
+                config.countdown_order_size_usd
+            );
+        } else if config.enable_countdown_strategy && config.proxy_address.is_none() {
+            warn!("倒计时策略已启用但未配置 POLYMARKET_PROXY_ADDRESS（卖出需持仓API），策略将跳过");
+        }
 
         // 监控订单簿更新
         loop {
-            // 收尾检查：距窗口结束 <= N 分钟时执行一次收尾（不跳出，继续监控直到窗口结束由下方「新窗口检测」自然切换）
+            // 收尾检查：距窗口结束 <= N 分钟时执行一次收尾（倒计时策略启用时不执行收尾）
             // 使用秒级精度，5分钟窗口下 num_minutes() 截断可能导致漏检
-            if config.wind_down_before_window_end_minutes > 0 && !wind_down_done {
+            if !config.enable_countdown_strategy
+                && config.wind_down_before_window_end_minutes > 0
+                && !wind_down_done
+            {
                 let now = Utc::now();
                 let seconds_until_end = (window_end - now).num_seconds();
                 let threshold_seconds = config.wind_down_before_window_end_minutes as i64 * 60;
@@ -648,15 +668,118 @@ async fn main() -> Result<()> {
                                     })
                                     .unwrap_or_else(|| "No:无".to_string());
 
-                                info!(
-                                    "{} {} | {} | {} | {}",
-                                    prefix,
-                                    market_display,
-                                    yes_info,
-                                    no_info,
-                                    spread_info
-                                );
-                                
+                                let seconds_until_end = (window_end - Utc::now()).num_seconds();
+                                let totals_str = if config.enable_countdown_strategy {
+                                    let t = countdown_totals.lock().unwrap();
+                                    format!(" | YES总量:{} NO总量:{}", t.0, t.1)
+                                } else {
+                                    String::new()
+                                };
+
+                                // 倒计时策略：日志每2秒输出一次；非倒计时策略：每次订单簿更新都输出
+                                let should_log = !config.enable_countdown_strategy
+                                    || last_log_time.elapsed() >= Duration::from_secs(2);
+                                if should_log {
+                                    last_log_time = Instant::now();
+                                    info!(
+                                        "{} {} | {} | {} | {} | 倒计时:{}秒{}",
+                                        prefix,
+                                        market_display,
+                                        yes_info,
+                                        no_info,
+                                        spread_info,
+                                        seconds_until_end,
+                                        totals_str
+                                    );
+                                }
+
+                                // 倒计时策略：50~60秒时买入价格较高的一边（$1），5秒时卖出
+                                if config.enable_countdown_strategy
+                                    && config.proxy_address.is_some()
+                                    && !wind_down_in_progress.load(Ordering::Relaxed)
+                                    && !countdown_positions.contains_key(&market_id)
+                                {
+                                    let buy_start = config.countdown_buy_window_end_secs as i64;
+                                    let buy_end = config.countdown_buy_window_start_secs as i64;
+                                    if seconds_until_end >= buy_start && seconds_until_end <= buy_end {
+                                        if let (Some((yes_price, _)), Some((no_price, _))) =
+                                            (yes_best_ask, no_best_ask)
+                                        {
+                                            let order_size_usd =
+                                                Decimal::try_from(config.countdown_order_size_usd)
+                                                    .unwrap_or(dec!(1.0));
+                                            let (token_id, side) = if yes_price >= no_price {
+                                                (pair.yes_book.asset_id, "YES")
+                                            } else {
+                                                (pair.no_book.asset_id, "NO")
+                                            };
+                                            let price = if yes_price >= no_price {
+                                                yes_price
+                                            } else {
+                                                no_price
+                                            };
+                                            let executor_cd = executor.clone();
+                                            let market_id_cd = market_id;
+                                            let market_display_cd = market_display.clone();
+                                            let countdown_positions_cd = countdown_positions.clone();
+                                            let countdown_totals_cd = countdown_totals.clone();
+                                            tokio::spawn(async move {
+                                                match executor_cd
+                                                    .buy_single_side(
+                                                        token_id,
+                                                        price,
+                                                        order_size_usd,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(res) => {
+                                                        let filled = res.taking_amount;
+                                                        if filled > dec!(0) {
+                                                            countdown_positions_cd.insert(
+                                                                market_id_cd,
+                                                                (token_id, side.to_string(), filled),
+                                                            );
+                                                            {
+                                                                let mut totals =
+                                                                    countdown_totals_cd.lock().unwrap();
+                                                                if side == "YES" {
+                                                                    totals.0 += filled;
+                                                                } else {
+                                                                    totals.1 += filled;
+                                                                }
+                                                            }
+                                                            let totals_guard =
+                                                                countdown_totals_cd.lock().unwrap();
+                                                            info!(
+                                                                "⏱️ 倒计时策略买入 | 市场:{} | 方向:{} | 价格:{:.4} | 数量:{} | 倒计时:{}秒 | YES总量:{} NO总量:{}",
+                                                                market_display_cd,
+                                                                side,
+                                                                price,
+                                                                filled,
+                                                                seconds_until_end,
+                                                                totals_guard.0,
+                                                                totals_guard.1
+                                                            );
+                                                        } else {
+                                                            debug!(
+                                                                market = %market_display_cd,
+                                                                "倒计时策略：订单未成交，可能稍后重试"
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            error = %e,
+                                                            market = %market_display_cd,
+                                                            "倒计时策略买入失败"
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+
                                 // 保留原有的结构化日志用于调试（可选）
                                 debug!(
                                     market_id = %pair.market_id,
@@ -665,8 +788,9 @@ async fn main() -> Result<()> {
                                     "订单簿对详细信息"
                                 );
 
-                                // 检测套利机会（监控阶段：只有当总价 <= 1 - 套利执行价差 时才执行套利）
+                                // 检测套利机会（倒计时策略启用时不执行套利）
                                 use rust_decimal::Decimal;
+                                if !config.enable_countdown_strategy {
                                 let execution_threshold = dec!(1.0) - Decimal::try_from(config.arbitrage_execution_spread)
                                     .unwrap_or(dec!(0.01));
                                 if let Some(total_price) = total_ask_price {
@@ -861,6 +985,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
+                                }
                             }
                         }
                         Some(Err(e)) => {
@@ -875,9 +1000,11 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // 定时仓位平衡任务
+                // 定时仓位平衡任务（倒计时策略启用时不执行）
                 _ = async {
-                    if let Some(ref mut timer) = balance_timer {
+                    if config.enable_countdown_strategy {
+                        futures::future::pending::<()>().await;
+                    } else if let Some(ref mut timer) = balance_timer {
                         timer.tick().await;
                         if let Err(e) = position_balancer.check_and_balance_positions(&market_token_map).await {
                             warn!(error = %e, "仓位平衡检查失败");
@@ -889,10 +1016,79 @@ async fn main() -> Result<()> {
                     // 仓位平衡任务已执行
                 }
 
-                // 定期检查：1) 是否进入新的5分钟窗口 2) 收尾触发（5分钟窗口需更频繁检查）
+                // 定期检查：1) 是否进入新的5分钟窗口 2) 倒计时策略卖出 3) 收尾触发
                 _ = sleep(Duration::from_secs(1)) => {
                     let now = Utc::now();
+                    let seconds_until_end = (window_end - now).num_seconds();
                     let new_window_timestamp = MarketDiscoverer::calculate_current_window_timestamp(now);
+
+                    // 倒计时策略：剩余5秒时卖出
+                    if config.enable_countdown_strategy
+                        && config.proxy_address.is_some()
+                        && seconds_until_end <= config.countdown_sell_at_secs as i64
+                        && !countdown_positions.is_empty()
+                    {
+                        let to_sell: Vec<_> = countdown_positions
+                            .iter()
+                            .map(|r| (r.key().clone(), r.value().0, r.value().1.clone(), r.value().2))
+                            .collect();
+                        for (market_id, _, _, _) in &to_sell {
+                            countdown_positions.remove(market_id);
+                        }
+                        if !to_sell.is_empty() {
+                            let executor_sell = executor.clone();
+                            let config_sell = config.clone();
+                            let countdown_totals_sell = countdown_totals.clone();
+                            let wind_down_sell_price =
+                                Decimal::try_from(config.wind_down_sell_price).unwrap_or(dec!(0.01));
+                            tokio::spawn(async move {
+                                match get_positions().await {
+                                    Ok(positions) => {
+                                        for (_market_id, token_id, side, _) in to_sell {
+                                            if let Some(pos) =
+                                                positions.iter().find(|p| p.asset == token_id && p.size > dec!(0))
+                                            {
+                                                let size_floor =
+                                                    (pos.size * dec!(100)).floor() / dec!(100);
+                                                if size_floor >= dec!(0.01) {
+                                                    if let Err(e) = executor_sell
+                                                        .sell_at_price(
+                                                            token_id,
+                                                            wind_down_sell_price,
+                                                            size_floor,
+                                                        )
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            token_id = %token_id,
+                                                            side = %side,
+                                                            error = %e,
+                                                            "倒计时策略卖出失败"
+                                                        );
+                                                    } else {
+                                                        let totals =
+                                                            countdown_totals_sell.lock().unwrap();
+                                                        info!(
+                                                            "⏱️ 倒计时策略卖出 | token:{:#x} | 方向:{} | 数量:{} | 倒计时:{}秒 | YES总量:{} NO总量:{}",
+                                                            token_id,
+                                                            side,
+                                                            size_floor,
+                                                            config_sell.countdown_sell_at_secs,
+                                                            totals.0,
+                                                            totals.1
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "倒计时策略：获取持仓失败，无法卖出");
+                                    }
+                                }
+                            });
+                        }
+                    }
 
                     // 如果当前窗口时间戳与记录的不同，说明已经进入新窗口
                     if new_window_timestamp != current_window_timestamp {

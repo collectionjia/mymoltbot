@@ -66,6 +66,17 @@ pub struct Config {
     pub wind_down_before_window_end_minutes: u64,
     /// 收尾时单腿卖出的限价单价格（尽量快速成交），默认0.01
     pub wind_down_sell_price: f64,
+    // ========== 倒计时策略 Countdown Strategy ==========
+    /// 是否启用倒计时策略：倒计时60-50秒买入价格较高的一边（$1），倒计时5秒卖出
+    pub enable_countdown_strategy: bool,
+    /// 倒计时买入窗口起始秒数（剩余多少秒时开始可买入），默认60
+    pub countdown_buy_window_start_secs: u64,
+    /// 倒计时买入窗口结束秒数（剩余多少秒时截止买入），默认50
+    pub countdown_buy_window_end_secs: u64,
+    /// 倒计时卖出触发秒数（剩余多少秒时卖出），默认5
+    pub countdown_sell_at_secs: u64,
+    /// 倒计时策略单笔下单金额（USD），默认1.0
+    pub countdown_order_size_usd: f64,
 }
 
 impl Config {
@@ -166,6 +177,26 @@ impl Config {
                 .unwrap_or_else(|_| "0.01".to_string())
                 .parse()
                 .unwrap_or(0.01), // 默认0.01
+            enable_countdown_strategy: env::var("ENABLE_COUNTDOWN_STRATEGY")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            countdown_buy_window_start_secs: env::var("COUNTDOWN_BUY_WINDOW_START_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
+            countdown_buy_window_end_secs: env::var("COUNTDOWN_BUY_WINDOW_END_SECS")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse()
+                .unwrap_or(50),
+            countdown_sell_at_secs: env::var("COUNTDOWN_SELL_AT_SECS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .unwrap_or(5),
+            countdown_order_size_usd: env::var("COUNTDOWN_ORDER_SIZE_USD")
+                .unwrap_or_else(|_| "1.0".to_string())
+                .parse()
+                .unwrap_or(1.0),
         })
     }
 }

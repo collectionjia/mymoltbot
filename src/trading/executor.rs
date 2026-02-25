@@ -100,6 +100,40 @@ impl TradingExecutor {
             .map_err(|e| anyhow::anyhow!("取消所有挂单失败: {}", e))
     }
 
+    /// 以指定价格和USD金额下 GTC 买单（倒计时策略：买入价格较高的一边）
+    /// size = usd_amount / price（1美元除以买入单价），保留2位小数
+    pub async fn buy_single_side(
+        &self,
+        token_id: U256,
+        price: Decimal,
+        usd_amount: Decimal,
+    ) -> Result<polymarket_client_sdk::clob::types::response::PostOrderResponse> {
+        if price <= dec!(0) || usd_amount <= dec!(0) {
+            return Err(anyhow::anyhow!("价格或金额必须大于0"));
+        }
+        let size = (usd_amount / price * dec!(100.0)).round() / dec!(100.0);
+        if size < dec!(0.01) {
+            return Err(anyhow::anyhow!("计算出的数量过小: {}", size));
+        }
+        let signer = LocalSigner::from_str(&self.private_key)?
+            .with_chain_id(Some(POLYGON));
+        let order = self
+            .client
+            .limit_order()
+            .token_id(token_id)
+            .side(Side::Buy)
+            .price(price)
+            .size(size)
+            .order_type(OrderType::GTC)
+            .build()
+            .await?;
+        let signed = self.client.sign(&signer, order).await?;
+        self.client
+            .post_order(signed)
+            .await
+            .map_err(|e| anyhow::anyhow!("买入订单提交失败: {}", e))
+    }
+
     /// 以指定价格下 GTC 卖单（收尾时市价意图卖出单腿持仓）
     pub async fn sell_at_price(
         &self,
